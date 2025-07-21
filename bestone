@@ -1,0 +1,329 @@
+#include "header.h"
+
+// Game and signal variables
+volatile sig_atomic_t game_over = 0;
+volatile sig_atomic_t player_done_signal = 0;
+volatile sig_atomic_t start_task_signal_received = 0;
+int max_score_reached = 0;
+int game_duration = 120;
+int max_score = 100; // Example maximum score
+int current_round = 0;
+siginfo_t last_signal_info;
+int winning_team = -1;
+// Track the start time of the game
+time_t start_time;  // Initialize in main function
+time_t current_time;
+// Global variables for display settings
+int active_player_y_offset = 150; // Distance below idle players to place active player
+
+
+// Define global variables
+Team teams[NUM_TEAMS];
+TeamPipes team_pipes[NUM_TEAMS];
+
+
+// Helper function to calculate the total score for a specific team
+int calculate_team_score(int team_id) {
+    int team_score = 0;  // Local variable for the team score
+    for (int player = 0; player < NUM_PLAYERS; player++) {
+        team_score += teams[team_id].players[player].score;
+        if (team_score >= max_score) {
+            max_score_reached = 1;
+        }
+    }
+    return team_score;
+}
+
+// Define the precise_sleep function
+void precise_sleep(int seconds) {
+    struct timespec req = {seconds, 0}, rem;
+    nanosleep(&req, &rem);
+}
+
+// Signal handler for referee process
+void referee_signal_handler(int signum, siginfo_t *info, void *context) {
+    last_signal_info = *info;
+    player_done_signal = 1;
+}
+
+void player_signal_handler(int signum) {
+    start_task_signal_received = 1;  // Set flag to indicate signal received
+    printf("Player signal handler activated. Task signal received set to 1.\n");
+}
+
+// Initialize game and players
+void init_game(int max_score, int max_duration) {
+    srand(time(NULL));
+    for (int team = 0; team < NUM_TEAMS; team++) {
+        for (int player = 0; player < NUM_PLAYERS; player++) {
+            teams[team].players[player] = (Player){
+                .player_id = player,
+                .energy = MIN_ENERGY + rand() % (MAX_ENERGY - MIN_ENERGY + 1),
+                .score = 0,
+                .state = (player == 0) ? READY_TO_JUMP : DONE
+            };
+            if (pipe(team_pipes[team].player_pipe[player]) == -1) {
+                perror("Pipe creation failed");
+                exit(1);
+            }
+        }
+    }
+    printf("Game initialized with %d teams.\n", NUM_TEAMS);
+}
+
+// Helper function to calculate jump time based on player's energy
+int calculate_jump_time(int energy) {
+    return energy < 50 ? 5 : (10 - energy / 20); // Example logic: higher energy, faster jump
+}
+
+// Helper function to generate random oscillation time
+int generate_oscillation_time() {
+    return random_delay(1, 3);  // Example range for random oscillation time
+}
+
+// Helper function to calculate pull time based on IDLE player's energy in team
+int calculate_pull_time(int team_id) {
+    int pull_time = 2;
+    for (int i = 0; i < NUM_PLAYERS; i++) {
+        if (teams[team_id].players[i].state == DONE) {
+            pull_time += teams[team_id].players[i].energy / 20;  // Example pull time based on idle player energy
+        }
+    }
+    return pull_time;
+}
+
+// Referee process to handle team competition asynchronously
+void referee_process() {
+    struct sigaction sa;
+    sa.sa_flags = SA_SIGINFO;
+    sa.sa_sigaction = referee_signal_handler;
+    sigaction(SIGUSR2, &sa, NULL);  // Setup handler for SIGUSR2
+
+    int current_players[NUM_TEAMS] = {0};
+    int winning_team = -1;
+
+    printf("Referee process started.\n");
+
+    while (!game_over || max_score_reached) {
+        // Calculate elapsed time since the game started
+        time_t current_time = time(NULL);
+        double elapsed_time = difftime(current_time, start_time);
+
+        // If elapsed time exceeds game duration, or any of the teams reached max score, end the game
+        if (elapsed_time >= game_duration || max_score_reached) {
+            break;
+        }
+
+        printf("--- New Round --- (Elapsed Time: %.0f seconds)\n", elapsed_time);
+
+        // Signal only players who are READY_TO_JUMP
+        for (int team = 0; team < NUM_TEAMS; team++) {
+            int player_id = current_players[team];
+            Player *player = &teams[team].players[player_id];
+
+            if (player->state == READY_TO_JUMP) {
+                printf("Referee signaling Player %d in Team %d with PID %d\n", player_id + 1, team + 1, player->pid);
+                kill(player->pid, SIGUSR1);  // Send SIGUSR1 signal using kill
+
+            }
+        }
+
+        int max_round_time = 10;  // Max time to wait for player response
+        int interval = 1;         // Polling interval in seconds
+
+        // Check each team's current player response by reading from pipes
+        for (int team = 0; team < NUM_TEAMS; team++) {
+            player_done_signal = 0;
+            int elapsed_interval = 0;
+            int player_done;
+
+            // Wait for the player to complete or timeout
+            while (!player_done_signal && elapsed_interval < max_round_time) {
+                ssize_t bytes_read = read(team_pipes[team].player_pipe[current_players[team]][0], &player_done, sizeof(player_done));
+                if (bytes_read > 0) {
+                    player_done_signal = 1;
+                }
+                sleep(interval);
+                elapsed_interval += interval;
+            }
+
+            if (player_done_signal) {
+                int completed_player = current_players[team];
+                printf("Referee received completion from Player %d in Team %d.\n", completed_player + 1, team + 1);
+
+                // Mark the current player as DONE
+                teams[team].players[completed_player].state = DONE;
+
+                // Move to the next player in the team
+                current_players[team] = (completed_player + 1) % NUM_PLAYERS;
+                int next_player = current_players[team];
+
+                // Set the next player to READY_TO_JUMP and re-signal them
+                teams[team].players[next_player].state = READY_TO_JUMP;
+                printf("Player %d in Team %d is now READY_TO_JUMP\n", next_player + 1, team + 1);
+
+                // Signal the next player to start their turn using kill
+                kill(teams[team].players[next_player].pid, SIGUSR1);
+            } else {
+                printf("Warning: No signal received from Team %d within maximum round time.\n", team + 1);
+            }
+            player_done_signal = 0; // Reset for the next round
+
+            // Check if any team has reached the max score
+            for (int team = 0; team < NUM_TEAMS; team++) {
+                int team_score = calculate_team_score(team);
+                if (team_score >= max_score) {
+                    winning_team = team;
+                    game_over = 1;  // Set game over flag to end the game
+                    printf("Team %d has reached the maximum score of %d!\n", team + 1, team_score);
+                    break;
+                }
+            }
+        }
+
+        if (game_over) {
+            break;
+        }  // Exit if a team has won
+    }
+
+    // End of game message
+    if (winning_team >= 0) {
+        printf("Team %d wins with a score of %d!\n", winning_team + 1, calculate_team_score(winning_team));
+    } else {
+        printf("Game time ended without a team reaching the maximum score.\n");
+    }
+
+    // Terminate all player processes
+    for (int team = 0; team < NUM_TEAMS; team++) {
+        for (int player = 0; player < NUM_PLAYERS; player++) {
+            kill(teams[team].players[player].pid, SIGTERM);
+        }
+    }
+
+    printf("Referee process finished.\n");
+}
+
+void player_process(int team_id, int player_id) {
+    printf("Player %d in Team %d: Setting up and waiting for signal\n", player_id + 1, team_id + 1);
+
+    // Define signal handling behavior
+    struct sigaction sa;
+    sa.sa_handler = player_signal_handler;
+    sa.sa_flags = SA_RESTART;  // Ensure that system calls are restarted after signal handling
+    sigaction(SIGUSR1, &sa, NULL);
+
+    // Set up the signal mask to allow SIGUSR1
+    sigset_t mask;
+    sigemptyset(&mask);
+    sigaddset(&mask, SIGUSR1);
+    sigprocmask(SIG_UNBLOCK, &mask, NULL);  // Ensure SIGUSR1 is unblocked
+
+    Player *player = &teams[team_id].players[player_id];
+
+    while (!game_over || max_score_reached) {
+        // Wait until signal flag is set by SIGUSR1
+        while (!start_task_signal_received) {
+            pause();  // Wait for SIGUSR1 to arrive and set start_task_signal_received
+        }
+        if (max_score_reached == 1) {
+            break;
+        }
+        start_task_signal_received = 0;  // Reset the flag immediately
+        printf("Player %d in Team %d received SIGUSR1, starting actions\n", player_id + 1, team_id + 1);
+
+        // Begin actions
+        int jump_time = calculate_jump_time(player->energy);
+        precise_sleep(jump_time);
+        player->energy -= calculate_energy_usage(jump_time);
+        player->score += calculate_score(jump_time);
+        printf("Player %d in Team %d completed jump with time %d with Energy: %d, Score: %d\n",
+               player_id + 1, team_id + 1, jump_time,player->energy, player->score);
+
+        // Oscillation action
+        int oscillation_time = generate_oscillation_time();
+        precise_sleep(oscillation_time);
+        printf("Player %d in Team %d oscillated. Time: %d seconds\n", player_id + 1, team_id + 1, oscillation_time);
+
+        // Pull action
+        int pull_time = calculate_pull_time(team_id);
+        precise_sleep(pull_time);
+        printf("Player %d in Team %d completed pulling. Time: %d seconds\n", player_id + 1, team_id + 1, pull_time);
+
+        // Notify referee of completion using pipe
+        int status_done = 1;
+        write(team_pipes[team_id].player_pipe[player_id][1], &status_done, sizeof(status_done));
+
+        // Transition the current player to DONE
+        player->state = DONE;
+
+        // Find the next player in the team to set to READY_TO_JUMP
+        int next_player_id = (player_id + 1) % NUM_PLAYERS;
+        teams[team_id].players[next_player_id].state = READY_TO_JUMP;
+
+        printf("Player %d in Team %d set Player %d in Team %d to READY_TO_JUMP\n",
+               player_id + 1, team_id + 1, next_player_id + 1, team_id + 1);
+        // Check if any team has reached the max score
+        for (int team = 0; team < NUM_TEAMS; team++) {
+            int team_score = calculate_team_score(team);
+            if (team_score >= max_score) {
+                winning_team = team;
+                game_over = 1;  // Set game over flag to end the game
+                printf("Team %d has reached the maximum score of %d!\n", team + 1, team_score);
+                // Terminate all player processes
+                for (int team = 0; team < NUM_TEAMS; team++) {
+                    for (int player = 0; player < NUM_PLAYERS; player++) {
+                        printf("Player %d in Team %d exiting as the game has ended.\n", player_id + 1, team_id + 1);
+                        kill(teams[team].players[player].pid, SIGTERM);
+                    }
+                }
+                break;
+            }
+        }
+    }
+    exit(0);
+}
+
+// Function to generate a random delay between min_time and max_time
+int random_delay(int min_time, int max_time) {
+    return rand() % (max_time - min_time + 1) + min_time;
+}
+
+// Function to calculate the energy used in a given action
+int calculate_energy_usage(int action_time) {
+    return action_time / 2;
+}
+
+// Function to calculate the score from an action time
+int calculate_score(int action_time) {
+    return 10 - action_time / 2;
+}
+
+int main(int argc, char** argv) {
+    start_time = time(NULL);
+    init_game(max_score,game_duration);
+
+
+    // Fork processes for players and referee
+    for (int team = 0; team < NUM_TEAMS; team++) {
+        for (int player = 0; player < NUM_PLAYERS; player++) {
+            pid_t pid = fork();
+            if (pid == 0) {
+                player_process(team, player);
+                exit(0);
+            } else {
+                teams[team].players[player].pid = pid;
+            }
+        }
+    }
+
+    pid_t referee_pid = fork();
+    if (referee_pid == 0) {
+        referee_process();
+        exit(0);
+    }
+
+
+    wait(NULL);
+    printf("Game ended.\n");
+    return 0;
+}
